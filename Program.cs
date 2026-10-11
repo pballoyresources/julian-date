@@ -1,5 +1,3 @@
-using System.Drawing.Drawing2D;
-using System.Drawing.Text;
 using System.Globalization;
 using System.Runtime.InteropServices;
 using Microsoft.Win32;
@@ -16,88 +14,169 @@ static class Program
         if (!isNew) return;
 
         ApplicationConfiguration.Initialize();
-        Application.Run(new TrayContext());
+        Application.Run(new BarWidget());
     }
 }
 
-sealed class TrayContext : ApplicationContext
+// Borderless always-on-top widget that docks on the taskbar, left of the system tray / clock.
+sealed class BarWidget : Form
 {
     const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
     const string RunName = "JulianBar";
+    const string ThemeKey = @"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize";
 
-    [DllImport("user32.dll", SetLastError = true)]
-    static extern bool DestroyIcon(IntPtr handle);
+    [StructLayout(LayoutKind.Sequential)]
+    struct RECT { public int Left, Top, Right, Bottom; }
 
-    readonly NotifyIcon tray;
-    readonly System.Windows.Forms.Timer timer;
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    static extern IntPtr FindWindow(string cls, string? title);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    static extern IntPtr FindWindowEx(IntPtr parent, IntPtr after, string cls, string? title);
+    [DllImport("user32.dll")]
+    static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+    [DllImport("user32.dll")]
+    static extern bool SetWindowPos(IntPtr hWnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
+
+    static readonly IntPtr HWND_TOPMOST = new(-1);
+    const uint SWP_NOACTIVATE = 0x0010, SWP_SHOWWINDOW = 0x0040;
+    const int WS_EX_TOOLWINDOW = 0x80, WS_EX_NOACTIVATE = 0x08000000;
+
+    readonly System.Windows.Forms.Timer dateTimer;
+    readonly System.Windows.Forms.Timer dockTimer;
     readonly ToolStripMenuItem startupItem;
-    string lastText = "";
+    string text = "";
+    string tooltip = "";
+    readonly ToolTip tip = new();
 
-    public TrayContext()
+    public BarWidget()
     {
+        FormBorderStyle = FormBorderStyle.None;
+        ShowInTaskbar = false;
+        StartPosition = FormStartPosition.Manual;
+        TopMost = true;
+        DoubleBuffered = true;
+
         startupItem = new ToolStripMenuItem("Start with Windows") { CheckOnClick = true, Checked = IsStartupEnabled() };
         startupItem.CheckedChanged += (_, _) => SetStartup(startupItem.Checked);
-
         var menu = new ContextMenuStrip();
         menu.Items.Add(startupItem);
         menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add("Quit App", null, (_, _) => ExitThread());
+        menu.Items.Add("Quit App", null, (_, _) => Close());
+        ContextMenuStrip = menu;
 
-        tray = new NotifyIcon { ContextMenuStrip = menu, Visible = true };
-
-        Refresh();
+        Refresh_();
+        Dock_();
 
         // Same as the Mac app: re-check every 60 seconds.
-        timer = new System.Windows.Forms.Timer { Interval = 60_000 };
-        timer.Tick += (_, _) => Refresh();
-        timer.Start();
+        dateTimer = new System.Windows.Forms.Timer { Interval = 60_000 };
+        dateTimer.Tick += (_, _) => Refresh_();
+        dateTimer.Start();
 
-        // Update right away after sleep/resume or a clock change.
-        SystemEvents.TimeChanged += (_, _) => Refresh();
-        SystemEvents.PowerModeChanged += (_, _) => Refresh();
+        // The taskbar can reclaim z-order or move/resize, so re-dock every couple of seconds.
+        dockTimer = new System.Windows.Forms.Timer { Interval = 2_000 };
+        dockTimer.Tick += (_, _) => Dock_();
+        dockTimer.Start();
+
+        SystemEvents.TimeChanged += (_, _) => Refresh_();
+        SystemEvents.PowerModeChanged += (_, _) => Refresh_();
+        SystemEvents.UserPreferenceChanged += (_, _) => Invalidate();
+        SystemEvents.DisplaySettingsChanged += (_, _) => Dock_();
     }
 
-    // Matches DateFormatter "yyD": 2-digit year + day of year (not zero-padded).
+    protected override CreateParams CreateParams
+    {
+        get
+        {
+            var cp = base.CreateParams;
+            cp.ExStyle |= WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE; // no Alt-Tab entry, never steals focus
+            return cp;
+        }
+    }
+
+    protected override bool ShowWithoutActivation => true;
+
+    // Zero-padded YYDDD, e.g. 26005.
     static string FormatDate(DateTime now) =>
         (now.Year % 100).ToString("00", CultureInfo.InvariantCulture) +
-        now.DayOfYear.ToString(CultureInfo.InvariantCulture);
+        now.DayOfYear.ToString("000", CultureInfo.InvariantCulture);
 
-    void Refresh()
+    void Refresh_()
     {
         var now = DateTime.Now;
-        var text = FormatDate(now);
-        if (text == lastText) return;
-        lastText = text;
-
-        var old = tray.Icon;
-        tray.Icon = RenderIcon(now.Year % 100, now.DayOfYear);
-        tray.Text = $"{text}  ({now:dddd, MMMM d, yyyy})";
-        if (old != null) { DestroyIcon(old.Handle); old.Dispose(); }
+        var t = FormatDate(now);
+        tooltip = now.ToString("dddd, MMMM d, yyyy", CultureInfo.CurrentCulture);
+        tip.SetToolTip(this, tooltip);
+        if (t == text) return;
+        text = t;
+        Invalidate();
     }
 
-    // Tray icons are tiny, so stack the year over the day of year.
-    static Icon RenderIcon(int yy, int doy)
+    void Dock_()
     {
-        const int size = 32; // Windows downscales for 100% DPI
-        using var bmp = new Bitmap(size, size);
-        using (var g = Graphics.FromImage(bmp))
+        var shell = FindWindow("Shell_TrayWnd", null);
+        if (shell == IntPtr.Zero || !GetWindowRect(shell, out var bar))
         {
-            g.Clear(Color.Transparent);
-            g.SmoothingMode = SmoothingMode.AntiAlias;
-            g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
-
-            using var font = new Font("Segoe UI", 14.5f, FontStyle.Bold, GraphicsUnit.Pixel);
-            var fmt = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
-            using var brush = new SolidBrush(Color.White);
-
-            g.DrawString(yy.ToString("00", CultureInfo.InvariantCulture), font, brush, new RectangleF(0, 0, size, size / 2f), fmt);
-            g.DrawString(doy.ToString(CultureInfo.InvariantCulture), font, brush, new RectangleF(0, size / 2f - 1, size, size / 2f), fmt);
+            // Fallback: bottom-right of primary screen.
+            var wa = Screen.PrimaryScreen!.Bounds;
+            Place(wa.Right - 260, wa.Bottom - 40, 80, 40);
+            return;
         }
-        IntPtr h = bmp.GetHicon();
-        using var temp = Icon.FromHandle(h);
-        var icon = (Icon)temp.Clone();
-        DestroyIcon(h);
-        return icon;
+
+        int barH = bar.Bottom - bar.Top;
+        int barW = bar.Right - bar.Left;
+        bool horizontal = barW >= barH;
+
+        using var g = CreateGraphics();
+        using var font = MakeFont();
+        var size = TextRenderer.MeasureText(g, string.IsNullOrEmpty(text) ? "00000" : text, font);
+        int w = size.Width + 20;
+
+        if (!horizontal)
+        {
+            // Vertical taskbar (left/right): sit at the bottom of the bar, above the tray.
+            Place(bar.Left, bar.Bottom - 120, barW, 28);
+            return;
+        }
+
+        // Anchor to the left edge of the system tray area (clock / icons).
+        int right = bar.Right;
+        var tray = FindWindowEx(shell, IntPtr.Zero, "TrayNotifyWnd", null);
+        if (tray != IntPtr.Zero && GetWindowRect(tray, out var t) && t.Left > bar.Left)
+            right = t.Left;
+        else
+            right = bar.Right - 240;
+
+        Place(right - w - 4, bar.Top, w, barH);
+    }
+
+    void Place(int x, int y, int w, int h)
+    {
+        SetWindowPos(Handle, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    }
+
+    static Font MakeFont() => new("Segoe UI Semibold", 11f, FontStyle.Regular, GraphicsUnit.Point);
+
+    static bool SystemIsLight()
+    {
+        using var key = Registry.CurrentUser.OpenSubKey(ThemeKey);
+        return key?.GetValue("SystemUsesLightTheme") is int v && v == 1;
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        bool light = SystemIsLight();
+        var bg = light ? Color.FromArgb(0xF3, 0xF3, 0xF3) : Color.FromArgb(0x1C, 0x1C, 0x1C);
+        var fg = light ? Color.FromArgb(0x1A, 0x1A, 0x1A) : Color.White;
+        e.Graphics.Clear(bg);
+        using var font = MakeFont();
+        TextRenderer.DrawText(e.Graphics, text, font, ClientRectangle, fg,
+            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+    }
+
+    protected override void OnResize(EventArgs e)
+    {
+        base.OnResize(e);
+        Invalidate();
     }
 
     static bool IsStartupEnabled()
@@ -112,13 +191,5 @@ sealed class TrayContext : ApplicationContext
         if (key == null) return;
         if (enable) key.SetValue(RunName, $"\"{Environment.ProcessPath}\"");
         else key.DeleteValue(RunName, throwOnMissingValue: false);
-    }
-
-    protected override void ExitThreadCore()
-    {
-        timer.Stop();
-        tray.Visible = false;
-        tray.Dispose();
-        base.ExitThreadCore();
     }
 }
